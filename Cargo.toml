@@ -1,0 +1,21 @@
+[package]
+name = "Snese4Rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+async-hid = { path = "../async-hid", features = ["tokio"] }
+crc = "3.0"
+futures-util = "0.3"
+indexmap = "2.12"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+windows = { version = "0.62", features = [
+	"Win32_Devices_Bluetooth",
+	"Win32_Foundation",
+	"Win32_System_IO",
+	"Win32_System_Ioctl",
+] }
+zerocopy = { version = "0.8", features = ["derive"] }
