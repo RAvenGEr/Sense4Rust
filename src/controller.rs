@@ -144,6 +144,15 @@ enum ConnectionType {
     Bluetooth,
 }
 
+impl ConnectionType {
+    fn report_offset(&self) -> usize {
+        match self {
+            ConnectionType::Usb => 0,
+            ConnectionType::Bluetooth => 2,
+        }
+    }
+}
+
 struct ControllerDevice {
     device: async_hid::Device,
     connection: ConnectionType,
@@ -194,7 +203,10 @@ impl ControllerDevice {
     fn bluetooth_address(&self) -> Option<u64> {
         match self.device.serial_number.as_deref() {
             Some(s) => u64::from_str_radix(s, 16).ok(),
-            None => todo!(),
+            None => match self.connection {
+                ConnectionType::Bluetooth => todo!(),
+                ConnectionType::Usb => None,
+            },
         }
     }
 
@@ -209,22 +221,42 @@ impl ControllerDevice {
                 return Err(Error::Busy);
             }
         }
+        let offset = self.connection.report_offset();
+        let is_bluetooth = self.connection == ConnectionType::Bluetooth;
         let mut reader = self.device.open_readable().await?;
         tokio::spawn(async move {
             let mut input_bytes = [0u8; 512];
+            let mut last_report = None;
             println!("Spawned input task");
 
             loop {
                 select! {
                     _ = cloned_token.cancelled() => {
-                        println!("Cancelled");
+                        println!("input task cancelled");
                         break;
                     }
                     res = reader.read_input_report(&mut input_bytes) => {
                         if let Ok(len) = res {
-                            // TODO: validate CRC??
-                            if let Ok((rep, _rem)) = InputReport::read_from_prefix(&input_bytes[..len]){
-                                println!("Have report: {}", rep.counter());
+                            // Validate CRC for Bluetooth packets
+                            if is_bluetooth
+                                && !validate_bluetooth_crc(&input_bytes[..len]) {
+                                println!("Invalid Bluetooth CRC, skipping report");
+                                continue;
+                            }
+
+                            if let Ok((rep, _rem)) = InputReport::read_from_prefix(&input_bytes[offset..len]){
+                                let this_report = rep.counter();
+                                if let Some(last) = last_report {
+                                    if this_report == last {
+                                        println!("Duplicate report");
+                                        continue;
+                                    }
+                                    let expected = (last + 1) % 0xF;
+                                    if this_report != expected {
+                                        println!("Expected: {expected} Received: {this_report}");
+                                    }
+                                }
+                                last_report = Some(this_report);
                             }
                         }
                     }
@@ -277,6 +309,25 @@ fn add_ds_checksum(report: &mut OutReport) {
     report[74..78].copy_from_slice(&checksum.to_le_bytes());
 }
 
+/// Validate CRC for Bluetooth packets
+/// Returns true if CRC is valid, false otherwise
+/// For Bluetooth packets, the report is 78 bytes with CRC in bytes 74-77
+fn validate_bluetooth_crc(report: &[u8]) -> bool {
+    let cs_bytes = report[74..=77].try_into();
+    if cs_bytes.is_err() {
+        eprintln!("Invalid report");
+        return false;
+    }
+    let actual_checksum = u32::from_le_bytes(cs_bytes.unwrap());
+    // Calculate expected CRC
+    let mut digest = CASTAGNOLI.digest();
+    digest.update(&[BT_HDR]);
+    digest.update(&report[0..74]);
+    let expected_checksum = digest.finalize();
+
+    expected_checksum == actual_checksum
+}
+
 pub struct DPadState {
     pub up: bool,
     pub right: bool,
@@ -306,6 +357,34 @@ pub struct InputReport {
     buttons_1: u8,
     buttons_2: u8,
     buttons_3: u8,
+    left_trigger: u8,
+    right_trigger: u8,
+    timestamp: u16,
+    imu_unknown: u8, // byte 12
+    imu_accel_x: i16,
+    imu_accel_y: i16,
+    imu_accel_z: i16,
+    imu_gyro_x: i16,
+    imu_gyro_y: i16,
+    imu_gyro_z: i16,
+    reserved_25: u8,
+    reserved_26: u8,
+    reserved_27: u8,
+    reserved_28: u8,
+    reserved_29: u8,
+    battery_status: u8,
+    reserved_31: u8,
+    reserved_32: u8,
+    reserved_33: u8,
+    reserved_34: u8,
+    touch0_tracking: u8,
+    touch0_x_low: u8,
+    touch0_x_high_y_low: u8,
+    touch0_y_high: u8,
+    touch1_tracking: u8,
+    touch1_x_low: u8,
+    touch1_x_high_y_low: u8,
+    touch1_y_high: u8,
 }
 
 impl InputReport {
@@ -395,5 +474,119 @@ impl InputReport {
     #[inline]
     pub fn touchpad_click(&self) -> bool {
         (self.buttons_3 & 0x02) != 0
+    }
+
+    // --- Trigger Values ---
+
+    #[inline]
+    pub fn left_trigger(&self) -> u8 {
+        self.left_trigger
+    }
+
+    #[inline]
+    pub fn right_trigger(&self) -> u8 {
+        self.right_trigger
+    }
+
+    // --- Timestamp ---
+
+    #[inline]
+    pub fn timestamp(&self) -> u16 {
+        self.timestamp
+    }
+
+    // --- IMU Data (Accelerometer & Gyro) ---
+
+    #[inline]
+    pub fn accel_x(&self) -> i16 {
+        self.imu_accel_x
+    }
+
+    #[inline]
+    pub fn accel_y(&self) -> i16 {
+        self.imu_accel_y
+    }
+
+    #[inline]
+    pub fn accel_z(&self) -> i16 {
+        self.imu_accel_z
+    }
+
+    #[inline]
+    pub fn gyro_x(&self) -> i16 {
+        self.imu_gyro_x
+    }
+
+    #[inline]
+    pub fn gyro_y(&self) -> i16 {
+        self.imu_gyro_y
+    }
+
+    #[inline]
+    pub fn gyro_z(&self) -> i16 {
+        self.imu_gyro_z
+    }
+
+    // --- Battery Status ---
+
+    #[inline]
+    pub fn battery_raw(&self) -> u8 {
+        self.battery_status & 0x0F
+    }
+
+    #[inline]
+    pub fn battery_charging(&self) -> bool {
+        (self.battery_status & 0x10) != 0
+    }
+
+    /// Convert raw battery value to percentage (0-100)
+    /// Max is 8 for normal charge, or higher for quick charge
+    #[inline]
+    pub fn battery_percent(&self) -> u8 {
+        let raw = self.battery_raw();
+        let max_battery = if self.battery_charging() { 100 } else { 105 };
+        std::cmp::min((raw as u32 * 100 / max_battery as u32) as u8, 100)
+    }
+
+    // --- Touchpad Data ---
+
+    #[inline]
+    pub fn touch0_id(&self) -> u8 {
+        self.touch0_tracking & 0x7F
+    }
+
+    #[inline]
+    pub fn touch0_active(&self) -> bool {
+        (self.touch0_tracking & 0x80) == 0
+    }
+
+    #[inline]
+    pub fn touch0_x(&self) -> i16 {
+        (((self.touch0_x_high_y_low & 0x0F) as i16) << 8) | (self.touch0_x_low as i16)
+    }
+
+    #[inline]
+    pub fn touch0_y(&self) -> i16 {
+        ((self.touch0_y_high as i16) << 4) | ((self.touch0_x_high_y_low & 0xF0) >> 4) as i16
+    }
+
+    #[inline]
+    pub fn touch1_id(&self) -> u8 {
+        self.touch1_tracking & 0x7F
+    }
+
+    #[inline]
+    pub fn touch1_active(&self) -> bool {
+        (self.touch1_tracking & 0x80) == 0
+    }
+
+    #[inline]
+    pub fn touch1_x(&self) -> i16 {
+        (((self.touch1_x_high_y_low & 0x0F) as i16) << 8) | (self.touch1_x_low as i16)
+    }
+
+    #[inline]
+    pub fn touch1_y(&self) -> i16 {
+        ((self.touch1_y_high as i16) << 4) | ((self.touch1_x_high_y_low & 0xF0) >> 4) as i16
     }
 }
