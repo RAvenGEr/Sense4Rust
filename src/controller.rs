@@ -1,11 +1,14 @@
-use std::{cell::Cell, hash::Hash, time::Duration};
+use std::{
+    cell::Cell,
+    hash::Hash,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use async_hid::{AsyncHidRead, AsyncHidWrite, Device};
-use crc::{CRC_32_ISO_HDLC, Crc};
 use thiserror::Error;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use zerocopy::FromBytes;
 
 use crate::windows_bluetooth::disconnect_bluetooth;
 
@@ -13,7 +16,7 @@ const SONY_VID: u16 = 0x054C;
 const DS4_PIDS: [u16; 2] = [0x05C4, 0x09CC];
 const DUALSENSE_PID: u16 = 0x0CE6;
 
-const OUT_REPORT_LEN: usize = 78;
+mod reports;
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -54,15 +57,15 @@ pub(crate) fn controller_type(device: &Device) -> Option<ControllerType> {
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Controller {
-    DualShock4(ControllerDevice),
-    DualSense(ControllerDevice),
+    DualShock4(DS4Controller),
+    DualSense(DualSenseController),
 }
 
 impl Controller {
     pub(crate) fn from_device(device: Device) -> Option<Controller> {
         controller_type(&device).map(|t| match t {
-            ControllerType::DualShock4 => Self::DualShock4(ControllerDevice::new(device)),
-            ControllerType::DualSense => Self::DualSense(ControllerDevice::new(device)),
+            ControllerType::DualShock4 => Self::DualShock4(DS4Controller::new(device)),
+            ControllerType::DualSense => Self::DualSense(DualSenseController::new(device)),
         })
     }
 
@@ -71,40 +74,30 @@ impl Controller {
     }
 
     pub(crate) fn id(&self) -> &async_hid::DeviceId {
-        &self.device().device.id
+        match self {
+            Controller::DualShock4(controller) => controller.id(),
+            Controller::DualSense(controller) => controller.id(),
+        }
     }
 
-    pub(crate) fn set_disconnect_on_drop(&mut self, disconnect: bool) {
-        self.device_mut().disconnect_on_drop = disconnect;
+    pub(crate) fn set_disconnect_on_drop(&self, disconnect: bool) {
+        match self {
+            Controller::DualShock4(controller) => controller.set_disconnect_on_drop(disconnect),
+            Controller::DualSense(controller) => controller.set_disconnect_on_drop(disconnect),
+        }
     }
 
     pub(crate) async fn process_inputs(&self) -> Result<()> {
-        let dev = self.device();
-        dev.process_input().await
+        match self {
+            Controller::DualShock4(controller) => controller.process_inputs().await,
+            Controller::DualSense(controller) => controller.process_inputs().await,
+        }
     }
 
     async fn power_off(&mut self) -> Result<()> {
-        let device = self.device_mut();
-        if device.connection == ConnectionType::Usb {
-            return Err(Error::Unsupported(
-                "Power off not available for USB connections",
-            ));
-        }
-
-        let mut report = empty_out_report();
         match self {
-            Controller::DualShock4(device) => {
-                report[0] = 0x11;
-                report[1] = 0x80;
-                report[3] = 0x08;
-                device.write_report(&mut report).await
-            }
-            Controller::DualSense(device) => {
-                report[0] = 0x31;
-                report[1] = 0x02;
-                report[10] = 0x02;
-                device.write_report(&mut report).await
-            }
+            Controller::DualShock4(controller) => controller.power_off().await,
+            Controller::DualSense(controller) => controller.power_off().await,
         }
     }
 
@@ -113,29 +106,6 @@ impl Controller {
             "Disconnect not available for USB connections",
         ))
     }
-
-    #[inline]
-    fn device_mut(&mut self) -> &mut ControllerDevice {
-        match self {
-            Controller::DualShock4(controller_device) => controller_device,
-            Controller::DualSense(controller_device) => controller_device,
-        }
-    }
-
-    #[inline]
-    fn device(&self) -> &ControllerDevice {
-        match &self {
-            Controller::DualShock4(controller_device) => controller_device,
-            Controller::DualSense(controller_device) => controller_device,
-        }
-    }
-}
-
-type OutReport = [u8; OUT_REPORT_LEN];
-
-#[inline(always)]
-fn empty_out_report() -> OutReport {
-    [0u8; OUT_REPORT_LEN]
 }
 
 #[derive(Debug, PartialEq)]
@@ -157,7 +127,7 @@ struct ControllerDevice {
     device: async_hid::Device,
     connection: ConnectionType,
     cancel: Cell<Option<CancellationToken>>,
-    disconnect_on_drop: bool,
+    disconnect_on_drop: AtomicBool,
 }
 
 impl std::fmt::Debug for ControllerDevice {
@@ -196,7 +166,17 @@ impl ControllerDevice {
             device,
             cancel: Cell::new(None),
             connection,
-            disconnect_on_drop: false,
+            disconnect_on_drop: AtomicBool::new(false),
+        }
+    }
+
+    fn input_busy(&self) -> bool {
+        let cancel = self.cancel.replace(None);
+        if cancel.is_some() {
+            _ = self.cancel.replace(cancel);
+            true
+        } else {
+            false
         }
     }
 
@@ -210,23 +190,18 @@ impl ControllerDevice {
         }
     }
 
+    /// Begin processing input reports
+    /// WARNING: This function should not be called a second time for the same device
     async fn process_input(&self) -> Result<()> {
-        let cloned_token;
-        {
-            let token = CancellationToken::new();
-            cloned_token = token.clone();
-            let cancel = self.cancel.replace(Some(token));
-            if cancel.is_some() {
-                _ = self.cancel.replace(cancel);
-                return Err(Error::Busy);
-            }
-        }
-        let offset = self.connection.report_offset();
+        let token = CancellationToken::new();
+        let cloned_token = token.clone();
+        _ = self.cancel.replace(Some(token));
         let is_bluetooth = self.connection == ConnectionType::Bluetooth;
+        let offset = self.connection.report_offset();
         let mut reader = self.device.open_readable().await?;
         tokio::spawn(async move {
             let mut input_bytes = [0u8; 512];
-            let mut last_report = None;
+            // let mut last_report = None;
             println!("Spawned input task");
 
             loop {
@@ -239,25 +214,24 @@ impl ControllerDevice {
                         if let Ok(len) = res {
                             // Validate CRC for Bluetooth packets
                             if is_bluetooth
-                                && !validate_bluetooth_crc(&input_bytes[..len]) {
-                                println!("Invalid Bluetooth CRC, skipping report");
+                                && (input_bytes[0] != 0x11 && input_bytes[0] != 0x31 || !validate_bluetooth_crc(&input_bytes[..len])) {
                                 continue;
                             }
 
-                            if let Ok((rep, _rem)) = InputReport::read_from_prefix(&input_bytes[offset..len]){
-                                let this_report = rep.counter();
-                                if let Some(last) = last_report {
-                                    if this_report == last {
-                                        println!("Duplicate report");
-                                        continue;
-                                    }
-                                    let expected = (last + 1) % 0xF;
-                                    if this_report != expected {
-                                        println!("Expected: {expected} Received: {this_report}");
-                                    }
-                                }
-                                last_report = Some(this_report);
-                            }
+                            // if let Ok((rep, _rem)) = InputReport::read_from_prefix(&input_bytes[offset..len]){
+                            //     let this_report = rep.counter();
+                            //     if let Some(last) = last_report {
+                            //         if this_report == last {
+                            //             println!("Duplicate report");
+                            //             continue;
+                            //         }
+                            //         let expected = (last + 1) % 0x3F;
+                            //         if this_report != expected {
+                            //             println!("Expected: {expected} Received: {this_report}");
+                            //         }
+                            //     }
+                            //     last_report = Some(this_report);
+                            // }
                         }
                     }
                 }
@@ -266,17 +240,8 @@ impl ControllerDevice {
         Ok(())
     }
 
-    async fn write_report(&self, report: &mut OutReport) -> Result<()> {
+    async fn write_report(&self, report: &[u8]) -> Result<()> {
         let mut writer = self.device.open_writeable().await?;
-        Self::write_report_writer(&mut writer, report).await
-    }
-
-    async fn write_report_writer<T: AsyncHidWrite>(
-        writer: &mut T,
-        report: &mut OutReport,
-    ) -> Result<()> {
-        add_ds_checksum(report);
-        println!("Sending report");
         writer.write_output_report(report).await?;
         Ok(())
     }
@@ -288,7 +253,7 @@ impl Drop for ControllerDevice {
             cancel.cancel();
             std::thread::sleep(Duration::from_millis(1));
         }
-        if self.disconnect_on_drop
+        if self.disconnect_on_drop.load(Ordering::Acquire)
             && let Some(addr) = self.bluetooth_address()
         {
             _ = disconnect_bluetooth(addr);
@@ -296,17 +261,157 @@ impl Drop for ControllerDevice {
     }
 }
 
-const CASTAGNOLI: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct DS4Controller {
+    device: ControllerDevice,
+}
+
+impl DS4Controller {
+    fn new(device: Device) -> Self {
+        let device = ControllerDevice::new(device);
+        Self { device }
+    }
+
+    #[inline]
+    fn id(&self) -> &async_hid::DeviceId {
+        &self.device.device.id
+    }
+
+    #[inline]
+    fn input_busy(&self) -> bool {
+        self.device.input_busy()
+    }
+
+    #[inline]
+    fn set_disconnect_on_drop(&self, disconnect: bool) {
+        self.device
+            .disconnect_on_drop
+            .store(disconnect, Ordering::Release);
+    }
+
+    async fn process_inputs(&self) -> Result<()> {
+        if self.device.input_busy() {
+            return Err(Error::Busy);
+        }
+        self.write_out_report().await?;
+        self.device.process_input().await
+    }
+
+    async fn power_off(&self) -> Result<()> {
+        if self.device.connection == ConnectionType::Usb {
+            return Err(Error::Unsupported(
+                "Power off not available for USB connections",
+            ));
+        }
+
+        let mut report = [0u8; 78];
+        report[0] = 0x11;
+        report[1] = 0x80;
+        report[3] = 0x08;
+        self.device.write_report(&report).await
+    }
+
+    async fn write_out_report(&self) -> Result<()> {
+        let mut out = [0u8; 78];
+        out[0] = 0x11;
+        out[1] = 0xC0;
+        out[3] = 0x07;
+        out[4] = 0x04;
+        // TODO: Handle other controller outputs
+        self.device.write_report(&out).await
+    }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct DualSenseController {
+    device: ControllerDevice,
+}
+
+impl DualSenseController {
+    fn new(device: Device) -> Self {
+        let device = ControllerDevice::new(device);
+        Self { device }
+    }
+
+    #[inline]
+    fn id(&self) -> &async_hid::DeviceId {
+        &self.device.device.id
+    }
+
+    #[inline]
+    fn input_busy(&self) -> bool {
+        self.device.input_busy()
+    }
+
+    #[inline]
+    fn set_disconnect_on_drop(&self, disconnect: bool) {
+        self.device
+            .disconnect_on_drop
+            .store(disconnect, Ordering::Release);
+    }
+
+    async fn process_inputs(&self) -> Result<()> {
+        if self.device.input_busy() {
+            return Err(Error::Busy);
+        }
+        self.write_out_report().await?;
+        self.device.process_input().await
+    }
+
+    async fn power_off(&self) -> Result<()> {
+        if self.device.connection == ConnectionType::Usb {
+            return Err(Error::Unsupported(
+                "Power off not available for USB connections",
+            ));
+        }
+
+        let mut report = [0u8; 78];
+        report[0] = 0x31;
+        report[1] = 0x02;
+        report[10] = 0x02;
+        append_checksum(BT_SEED, &mut report);
+        self.device.write_report(&report).await
+    }
+
+    async fn write_out_report(&self) -> Result<()> {
+        let mut out = [0u8; 78];
+        out[0] = 0x31;
+        out[1] = 0x02;
+        out[2] = 0x0F;
+        out[3] = 0x55;
+        append_checksum(BT_SEED, &mut out);
+        // TODO: Handle other controller outputs
+        self.device.write_report(&out).await
+    }
+}
+
 const BT_HDR: u8 = 0xA2;
+const DEFAULT_SEED: u32 = 0xffffffff;
+const BT_SEED: u32 = 0x8C2C830C;
 
-fn add_ds_checksum(report: &mut OutReport) {
-    // CRC calculation: Seed with 0xA2, then the report up to the CRC offset
-    let mut digest = CASTAGNOLI.digest();
-    digest.update(&[BT_HDR]);
-    digest.update(&report[0..74]);
-    let checksum = digest.finalize();
+#[inline]
+fn calculate_checksum(init: u32, report: &[u8]) -> u32 {
+    let custom_params = crc_fast::CrcParams::new(
+        "CRC-32/CUSTOM",
+        32,
+        0x04c11db7,
+        init as u64,
+        true,
+        0xffffffff,
+        0xcbf43926,
+    );
+    let checksum = crc_fast::checksum_with_params(custom_params, report);
+    checksum as u32
+}
 
-    report[74..78].copy_from_slice(&checksum.to_le_bytes());
+#[inline]
+fn append_checksum(init: u32, report: &mut [u8]) {
+    if report.len() < 5 {
+        return;
+    }
+    let last = report.len() - 4;
+    let crc = calculate_checksum(init, &report[..last]);
+    report[last..].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Validate CRC for Bluetooth packets
@@ -318,275 +423,13 @@ fn validate_bluetooth_crc(report: &[u8]) -> bool {
         eprintln!("Invalid report");
         return false;
     }
-    let actual_checksum = u32::from_le_bytes(cs_bytes.unwrap());
-    // Calculate expected CRC
-    let mut digest = CASTAGNOLI.digest();
-    digest.update(&[BT_HDR]);
-    digest.update(&report[0..74]);
-    let expected_checksum = digest.finalize();
+    let sent_checksum = u32::from_le_bytes(cs_bytes.unwrap());
+    let calculated_checksum = calculate_checksum(BT_SEED, &report[..74]);
 
-    expected_checksum == actual_checksum
-}
-
-pub struct DPadState {
-    pub up: bool,
-    pub right: bool,
-    pub down: bool,
-    pub left: bool,
-}
-
-impl DPadState {
-    fn new(up: bool, right: bool, down: bool, left: bool) -> Self {
-        Self {
-            up,
-            right,
-            down,
-            left,
-        }
-    }
-}
-
-#[derive(FromBytes, Debug)]
-#[repr(C, packed)]
-pub struct InputReport {
-    report_id: u8,
-    left_stick_x: u8,
-    left_stick_y: u8,
-    right_stick_x: u8,
-    right_stick_y: u8,
-    buttons_1: u8,
-    buttons_2: u8,
-    buttons_3: u8,
-    left_trigger: u8,
-    right_trigger: u8,
-    timestamp: u16,
-    imu_unknown: u8, // byte 12
-    imu_accel_x: i16,
-    imu_accel_y: i16,
-    imu_accel_z: i16,
-    imu_gyro_x: i16,
-    imu_gyro_y: i16,
-    imu_gyro_z: i16,
-    reserved_25: u8,
-    reserved_26: u8,
-    reserved_27: u8,
-    reserved_28: u8,
-    reserved_29: u8,
-    battery_status: u8,
-    reserved_31: u8,
-    reserved_32: u8,
-    reserved_33: u8,
-    reserved_34: u8,
-    touch0_tracking: u8,
-    touch0_x_low: u8,
-    touch0_x_high_y_low: u8,
-    touch0_y_high: u8,
-    touch1_tracking: u8,
-    touch1_x_low: u8,
-    touch1_x_high_y_low: u8,
-    touch1_y_high: u8,
-}
-
-impl InputReport {
-    #[inline]
-    pub fn counter(&self) -> u8 {
-        self.buttons_3 >> 2
-    }
-
-    pub fn dpad_state(&self) -> DPadState {
-        let val = self.buttons_1 & 0x0F; // Mask out the upper buttons
-        match val {
-            0 => DPadState::new(true, false, false, false), // North (Up)
-            1 => DPadState::new(true, true, false, false),  // North-East
-            2 => DPadState::new(false, true, false, false), // East (Right)
-            3 => DPadState::new(false, true, true, false),  // South-East
-            4 => DPadState::new(false, false, true, false), // South (Down)
-            5 => DPadState::new(false, false, true, true),  // South-West
-            6 => DPadState::new(false, false, false, true), // West (Left)
-            7 => DPadState::new(true, false, false, true),  // North-West
-            _ => DPadState::new(false, false, false, false), // Released
-        }
-    }
-
-    // --- Shapes ---
-
-    #[inline]
-    pub fn triangle(&self) -> bool {
-        (self.buttons_1 & 0x80) != 0
-    }
-    #[inline]
-    pub fn circle(&self) -> bool {
-        (self.buttons_1 & 0x40) != 0
-    }
-    #[inline]
-    pub fn cross(&self) -> bool {
-        (self.buttons_1 & 0x20) != 0
-    }
-    #[inline]
-    pub fn square(&self) -> bool {
-        (self.buttons_1 & 0x10) != 0
-    }
-
-    // --- Shoulders & Sticks ---
-
-    #[inline]
-    pub fn l1(&self) -> bool {
-        (self.buttons_2 & 0x01) != 0
-    }
-    #[inline]
-    pub fn r1(&self) -> bool {
-        (self.buttons_2 & 0x02) != 0
-    }
-    #[inline]
-    pub fn l2(&self) -> bool {
-        (self.buttons_2 & 0x04) != 0
-    }
-    #[inline]
-    pub fn r2(&self) -> bool {
-        (self.buttons_2 & 0x08) != 0
-    }
-    #[inline]
-    pub fn l3(&self) -> bool {
-        (self.buttons_2 & 0x40) != 0
-    }
-    #[inline]
-    pub fn r3(&self) -> bool {
-        (self.buttons_2 & 0x80) != 0
-    }
-
-    // --- Center Buttons ---
-
-    #[inline]
-    pub fn share(&self) -> bool {
-        (self.buttons_2 & 0x10) != 0
-    }
-    #[inline]
-    pub fn options(&self) -> bool {
-        (self.buttons_2 & 0x20) != 0
-    }
-    #[inline]
-    pub fn ps_home(&self) -> bool {
-        (self.buttons_3 & 0x01) != 0
-    }
-
-    // --- Touchpad ---
-
-    #[inline]
-    pub fn touchpad_click(&self) -> bool {
-        (self.buttons_3 & 0x02) != 0
-    }
-
-    // --- Trigger Values ---
-
-    #[inline]
-    pub fn left_trigger(&self) -> u8 {
-        self.left_trigger
-    }
-
-    #[inline]
-    pub fn right_trigger(&self) -> u8 {
-        self.right_trigger
-    }
-
-    // --- Timestamp ---
-
-    #[inline]
-    pub fn timestamp(&self) -> u16 {
-        self.timestamp
-    }
-
-    // --- IMU Data (Accelerometer & Gyro) ---
-
-    #[inline]
-    pub fn accel_x(&self) -> i16 {
-        self.imu_accel_x
-    }
-
-    #[inline]
-    pub fn accel_y(&self) -> i16 {
-        self.imu_accel_y
-    }
-
-    #[inline]
-    pub fn accel_z(&self) -> i16 {
-        self.imu_accel_z
-    }
-
-    #[inline]
-    pub fn gyro_x(&self) -> i16 {
-        self.imu_gyro_x
-    }
-
-    #[inline]
-    pub fn gyro_y(&self) -> i16 {
-        self.imu_gyro_y
-    }
-
-    #[inline]
-    pub fn gyro_z(&self) -> i16 {
-        self.imu_gyro_z
-    }
-
-    // --- Battery Status ---
-
-    #[inline]
-    pub fn battery_raw(&self) -> u8 {
-        self.battery_status & 0x0F
-    }
-
-    #[inline]
-    pub fn battery_charging(&self) -> bool {
-        (self.battery_status & 0x10) != 0
-    }
-
-    /// Convert raw battery value to percentage (0-100)
-    /// Max is 8 for normal charge, or higher for quick charge
-    #[inline]
-    pub fn battery_percent(&self) -> u8 {
-        let raw = self.battery_raw();
-        let max_battery = if self.battery_charging() { 100 } else { 105 };
-        std::cmp::min((raw as u32 * 100 / max_battery as u32) as u8, 100)
-    }
-
-    // --- Touchpad Data ---
-
-    #[inline]
-    pub fn touch0_id(&self) -> u8 {
-        self.touch0_tracking & 0x7F
-    }
-
-    #[inline]
-    pub fn touch0_active(&self) -> bool {
-        (self.touch0_tracking & 0x80) == 0
-    }
-
-    #[inline]
-    pub fn touch0_x(&self) -> i16 {
-        (((self.touch0_x_high_y_low & 0x0F) as i16) << 8) | (self.touch0_x_low as i16)
-    }
-
-    #[inline]
-    pub fn touch0_y(&self) -> i16 {
-        ((self.touch0_y_high as i16) << 4) | ((self.touch0_x_high_y_low & 0xF0) >> 4) as i16
-    }
-
-    #[inline]
-    pub fn touch1_id(&self) -> u8 {
-        self.touch1_tracking & 0x7F
-    }
-
-    #[inline]
-    pub fn touch1_active(&self) -> bool {
-        (self.touch1_tracking & 0x80) == 0
-    }
-
-    #[inline]
-    pub fn touch1_x(&self) -> i16 {
-        (((self.touch1_x_high_y_low & 0x0F) as i16) << 8) | (self.touch1_x_low as i16)
-    }
-
-    #[inline]
-    pub fn touch1_y(&self) -> i16 {
-        ((self.touch1_y_high as i16) << 4) | ((self.touch1_x_high_y_low & 0xF0) >> 4) as i16
+    if calculated_checksum == sent_checksum {
+        true
+    } else {
+        eprintln!("BT checksum fail calculated: {calculated_checksum:x} sent: {sent_checksum:x}");
+        false
     }
 }

@@ -1,12 +1,12 @@
 [package]
-name = "Snese4Rust"
+name = "Sense4Rust"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
 async-hid = { path = "../async-hid", features = ["tokio"] }
-crc = "3.0"
+crc-fast = "1.10"
 futures-util = "0.3"
 indexmap = "2.12"
 thiserror = "2.0"
