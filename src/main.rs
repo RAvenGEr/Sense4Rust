@@ -24,6 +24,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for dev in device_set.iter() {
         println!("Controller: {dev:?}");
         dev.set_disconnect_on_drop(true);
+
+        // let dev_clone = dev.clone();
+        // tokio::spawn(async move {
+        //      if let Err(res) = dev_clone.process_inputs().await {
+        //          eprintln!("Error starting processing: {res}");
+        //          return;
+        //      }
+
+        //      // LED Verification Cycle
+        //      let colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)];
+        //      for (r, g, b) in colors {
+        //          println!("Setting LED to ({r}, {g}, {b})");
+        //          if let Err(e) = dev_clone.set_led(r, g, b).await {
+        //              eprintln!("Failed to set LED: {e}");
+        //          }
+        //          tokio::time::sleep(Duration::from_secs(1)).await;
+        //      }
+        //      // Reset to off
+        //      _ = dev_clone.set_led(0, 0, 0).await;
+        // });
     }
 
     println!("Number of connected devices: {}", device_set.len());
@@ -50,13 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 )
                                 .collect::<HashSet<_>>();
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                             for controller in new_dev.iter() {
                                 println!("Controller: {controller:?}");
-
-                                 tokio::time::sleep(Duration::from_millis(100)).await;
-                                 if let Err(res) = controller.process_inputs().await {
-                                     eprintln!("Error starting processing: {res}");
-                                 }
+                                if let Err(res) = controller.set_led(255, 0,0).await {
+                                    eprintln!("Error setting LED: {res}");
+                                }
+                                if let Err(res) = controller.process_inputs().await {
+                                    eprintln!("Error starting processing: {res}");
+                                }
                             }
                             device_set.extend(new_dev);
                         }

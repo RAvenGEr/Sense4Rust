@@ -1,5 +1,4 @@
 use std::{
-    cell::Cell,
     hash::Hash,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -9,6 +8,7 @@ use async_hid::{AsyncHidRead, AsyncHidWrite, Device};
 use thiserror::Error;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::windows_bluetooth::disconnect_bluetooth;
 
@@ -16,7 +16,8 @@ const SONY_VID: u16 = 0x054C;
 const DS4_PIDS: [u16; 2] = [0x05C4, 0x09CC];
 const DUALSENSE_PID: u16 = 0x0CE6;
 
-mod reports;
+mod sony_reports;
+use sony_reports::{Ds4BtOutput, Ds4UsbOutput, DualSenseBtOutput, DualSenseUsbOutput};
 
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -94,6 +95,13 @@ impl Controller {
         }
     }
 
+    pub(crate) async fn set_led(&self, r: u8, g: u8, b: u8) -> Result<()> {
+        match self {
+            Controller::DualShock4(controller) => controller.set_led(r, g, b).await,
+            Controller::DualSense(controller) => controller.set_led(r, g, b).await,
+        }
+    }
+
     async fn power_off(&mut self) -> Result<()> {
         match self {
             Controller::DualShock4(controller) => controller.power_off().await,
@@ -114,19 +122,11 @@ enum ConnectionType {
     Bluetooth,
 }
 
-impl ConnectionType {
-    fn report_offset(&self) -> usize {
-        match self {
-            ConnectionType::Usb => 0,
-            ConnectionType::Bluetooth => 2,
-        }
-    }
-}
-
 struct ControllerDevice {
     device: async_hid::Device,
     connection: ConnectionType,
-    cancel: Cell<Option<CancellationToken>>,
+    cancel: CancellationToken,
+    running: AtomicBool,
     disconnect_on_drop: AtomicBool,
 }
 
@@ -164,20 +164,15 @@ impl ControllerDevice {
         };
         Self {
             device,
-            cancel: Cell::new(None),
             connection,
+            cancel: CancellationToken::new(),
+            running: AtomicBool::new(false),
             disconnect_on_drop: AtomicBool::new(false),
         }
     }
 
     fn input_busy(&self) -> bool {
-        let cancel = self.cancel.replace(None);
-        if cancel.is_some() {
-            _ = self.cancel.replace(cancel);
-            true
-        } else {
-            false
-        }
+        self.running.load(Ordering::Acquire)
     }
 
     fn bluetooth_address(&self) -> Option<u64> {
@@ -193,11 +188,7 @@ impl ControllerDevice {
     /// Begin processing input reports
     /// WARNING: This function should not be called a second time for the same device
     async fn process_input(&self) -> Result<()> {
-        let token = CancellationToken::new();
-        let cloned_token = token.clone();
-        _ = self.cancel.replace(Some(token));
-        let is_bluetooth = self.connection == ConnectionType::Bluetooth;
-        let offset = self.connection.report_offset();
+        let cloned_token = self.cancel.clone();
         let mut reader = self.device.open_readable().await?;
         tokio::spawn(async move {
             let mut input_bytes = [0u8; 512];
@@ -211,27 +202,8 @@ impl ControllerDevice {
                         break;
                     }
                     res = reader.read_input_report(&mut input_bytes) => {
-                        if let Ok(len) = res {
-                            // Validate CRC for Bluetooth packets
-                            if is_bluetooth
-                                && (input_bytes[0] != 0x11 && input_bytes[0] != 0x31 || !validate_bluetooth_crc(&input_bytes[..len])) {
-                                continue;
-                            }
-
-                            // if let Ok((rep, _rem)) = InputReport::read_from_prefix(&input_bytes[offset..len]){
-                            //     let this_report = rep.counter();
-                            //     if let Some(last) = last_report {
-                            //         if this_report == last {
-                            //             println!("Duplicate report");
-                            //             continue;
-                            //         }
-                            //         let expected = (last + 1) % 0x3F;
-                            //         if this_report != expected {
-                            //             println!("Expected: {expected} Received: {this_report}");
-                            //         }
-                            //     }
-                            //     last_report = Some(this_report);
-                            // }
+                        if let Ok(_len) = res {
+                            // TODO: Support injection of report processing
                         }
                     }
                 }
@@ -249,8 +221,8 @@ impl ControllerDevice {
 
 impl Drop for ControllerDevice {
     fn drop(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            cancel.cancel();
+        if self.input_busy() {
+            self.cancel.cancel();
             std::thread::sleep(Duration::from_millis(1));
         }
         if self.disconnect_on_drop.load(Ordering::Acquire)
@@ -293,8 +265,30 @@ impl DS4Controller {
         if self.device.input_busy() {
             return Err(Error::Busy);
         }
-        self.write_out_report().await?;
+        self.set_led(0, 0, 0).await?;
         self.device.process_input().await
+    }
+
+    pub(crate) async fn set_led(&self, r: u8, g: u8, b: u8) -> Result<()> {
+        match self.device.connection {
+            ConnectionType::Usb => {
+                let mut report = Ds4UsbOutput::new();
+                // report.control_flags = 0x01 | 0x02 | 0x04; // Rumble + LED
+                // report.lightbar_red = r;
+                // report.lightbar_green = g;
+                // report.lightbar_blue = b;
+                self.device.write_report(report.as_bytes()).await
+            }
+            ConnectionType::Bluetooth => {
+                let mut report = Ds4BtOutput::new();
+                // report.control_flags = 0x01 | 0x02 | 0x04; // Rumble + LED
+                // report.lightbar_red = r;
+                // report.lightbar_green = g;
+                // report.lightbar_blue = b;
+                report.add_crc();
+                self.device.write_report(report.as_bytes()).await
+            }
+        }
     }
 
     async fn power_off(&self) -> Result<()> {
@@ -309,16 +303,6 @@ impl DS4Controller {
         report[1] = 0x80;
         report[3] = 0x08;
         self.device.write_report(&report).await
-    }
-
-    async fn write_out_report(&self) -> Result<()> {
-        let mut out = [0u8; 78];
-        out[0] = 0x11;
-        out[1] = 0xC0;
-        out[3] = 0x07;
-        out[4] = 0x04;
-        // TODO: Handle other controller outputs
-        self.device.write_report(&out).await
     }
 }
 
@@ -354,8 +338,40 @@ impl DualSenseController {
         if self.device.input_busy() {
             return Err(Error::Busy);
         }
-        self.write_out_report().await?;
+        self.set_led(0, 0, 0).await?;
         self.device.process_input().await
+    }
+
+    pub(crate) async fn set_led(&self, r: u8, g: u8, b: u8) -> Result<()> {
+        match self.device.connection {
+            ConnectionType::Usb => {
+                let mut report = DualSenseUsbOutput::new();
+                // report.control_flags1 = 0x01 | 0x02; // Rumble
+                // report.control_flags2 = 0x04; // LED
+                // report.lightbar_red = r;
+                // report.lightbar_green = g;
+                // report.lightbar_blue = b;
+                self.device.write_report(report.as_bytes()).await
+            }
+            ConnectionType::Bluetooth => {
+                let mut report = DualSenseBtOutput::new();
+                report.payload.led_red = r;
+                report.payload.led_green = g;
+                report.payload.led_blue = b;
+                report.add_crc();
+                let bytes = report.as_bytes();
+                println!("Rust DualSense BT 'Red Lightbar' Payload:");
+                println!("------------------------------------------------");
+                for (i, byte) in bytes.iter().enumerate() {
+                    print!("{:02X} ", byte);
+                    if (i + 1) % 16 == 0 {
+                        println!();
+                    }
+                }
+                println!("\n------------------------------------------------");
+                self.device.write_report(bytes).await
+            }
+        }
     }
 
     async fn power_off(&self) -> Result<()> {
@@ -369,67 +385,7 @@ impl DualSenseController {
         report[0] = 0x31;
         report[1] = 0x02;
         report[10] = 0x02;
-        append_checksum(BT_SEED, &mut report);
+        // append_checksum(BT_SEED, &mut report);
         self.device.write_report(&report).await
-    }
-
-    async fn write_out_report(&self) -> Result<()> {
-        let mut out = [0u8; 78];
-        out[0] = 0x31;
-        out[1] = 0x02;
-        out[2] = 0x0F;
-        out[3] = 0x55;
-        append_checksum(BT_SEED, &mut out);
-        // TODO: Handle other controller outputs
-        self.device.write_report(&out).await
-    }
-}
-
-const BT_HDR: u8 = 0xA2;
-const DEFAULT_SEED: u32 = 0xffffffff;
-const BT_SEED: u32 = 0x8C2C830C;
-
-#[inline]
-fn calculate_checksum(init: u32, report: &[u8]) -> u32 {
-    let custom_params = crc_fast::CrcParams::new(
-        "CRC-32/CUSTOM",
-        32,
-        0x04c11db7,
-        init as u64,
-        true,
-        0xffffffff,
-        0xcbf43926,
-    );
-    let checksum = crc_fast::checksum_with_params(custom_params, report);
-    checksum as u32
-}
-
-#[inline]
-fn append_checksum(init: u32, report: &mut [u8]) {
-    if report.len() < 5 {
-        return;
-    }
-    let last = report.len() - 4;
-    let crc = calculate_checksum(init, &report[..last]);
-    report[last..].copy_from_slice(&crc.to_le_bytes());
-}
-
-/// Validate CRC for Bluetooth packets
-/// Returns true if CRC is valid, false otherwise
-/// For Bluetooth packets, the report is 78 bytes with CRC in bytes 74-77
-fn validate_bluetooth_crc(report: &[u8]) -> bool {
-    let cs_bytes = report[74..=77].try_into();
-    if cs_bytes.is_err() {
-        eprintln!("Invalid report");
-        return false;
-    }
-    let sent_checksum = u32::from_le_bytes(cs_bytes.unwrap());
-    let calculated_checksum = calculate_checksum(BT_SEED, &report[..74]);
-
-    if calculated_checksum == sent_checksum {
-        true
-    } else {
-        eprintln!("BT checksum fail calculated: {calculated_checksum:x} sent: {sent_checksum:x}");
-        false
     }
 }
